@@ -31,6 +31,7 @@ import os
 from minisweagent.agents.default import DefaultAgent
 from minisweagent.config import builtin_config_dir, get_config_path
 from minisweagent.environments.docker import DockerEnvironment
+from minisweagent.environments.singularity import SingularityEnvironment
 from minisweagent.models import get_model
 
 from minisweagent.run.extra.utils.batch_progress import RunBatchProgressManager
@@ -147,7 +148,8 @@ def process_instance_proc(
     model_name: Optional[str],
     config_path: str | Path,
     progress_queue,
-    docker_start_sem=None,  # 可选：控制“启动 Docker”的并发
+    docker_start_sem=None,  # 可选：控制"启动 Docker"的并发
+    environment_class: str = "singularity",  # 默认使用 Apptainer/Singularity
 ):
     """单个实例的子进程执行体。返回给主进程用于统一写 preds.json 与收尾 UI。"""
     instance_id = instance["instance_id"]
@@ -170,9 +172,12 @@ def process_instance_proc(
     agent = None
     extra_info = None
 
-    # （强烈推荐）限制“拉起/连接 Docker 环境”的并发数
+    # Determine container runtime name for status messages
+    runtime_name = "apptainer" if environment_class == "singularity" else "docker"
+
+    # （强烈推荐）限制"拉起/连接容器环境"的并发数
     try:
-        progress_queue.put({"t": "status", "id": instance_id, "msg": "Pulling/starting docker (queued)"})
+        progress_queue.put({"t": "status", "id": instance_id, "msg": f"Pulling/starting {runtime_name} (queued)"})
     except Exception:
         pass
 
@@ -182,10 +187,20 @@ def process_instance_proc(
     try:
         try:
             try:
-                progress_queue.put({"t": "status", "id": instance_id, "msg": "Pulling/starting docker"})
+                progress_queue.put({"t": "status", "id": instance_id, "msg": f"Pulling/starting {runtime_name}"})
             except Exception:
                 pass
-            env = DockerEnvironment(**(config.get("environment", {}) | {"image": image_name}))
+
+            # Choose environment based on environment_class
+            env_config = config.get("environment", {}).copy()
+            if environment_class == "singularity":
+                # For Singularity/Apptainer, prepend docker:// to pull from Docker Hub
+                env_config["image"] = "docker://" + image_name
+                env = SingularityEnvironment(**env_config)
+            else:
+                # Docker environment
+                env_config["image"] = image_name
+                env = DockerEnvironment(**env_config)
         finally:
             if docker_start_sem is not None:
                 docker_start_sem.release()
@@ -329,7 +344,11 @@ def main(
     ),
     docker_start_concurrency: int = typer.Option(
         8, "--docker-start-concurrency",
-        help="Max concurrent 'start docker environment' ops to avoid daemon/disk thrash",
+        help="Max concurrent 'start container environment' ops to avoid daemon/disk thrash",
+    ),
+    environment_class: str = typer.Option(
+        "singularity", "--environment-class",
+        help="Environment type: 'singularity' (default, for Apptainer/Singularity) or 'docker'",
     ),
 ) -> None:
     # 加载数据集
@@ -380,6 +399,10 @@ def main(
     )
     pump_thread.start()
 
+    # Print runtime info
+    runtime_name = "Apptainer/Singularity" if environment_class == "singularity" else "Docker"
+    print(f"Container runtime: {runtime_name}")
+
     # Live 渲染 + 进程池执行
     with Live(progress_manager.render_group, refresh_per_second=4):
         with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as executor:
@@ -391,7 +414,8 @@ def main(
                     model,
                     config,
                     progress_queue,
-                    docker_sem
+                    docker_sem,
+                    environment_class,
                 ): instance["instance_id"]
                 for instance in instances
             }
