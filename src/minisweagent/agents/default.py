@@ -53,6 +53,10 @@ class LimitsExceeded(TerminatingException):
     """Raised when the agent has reached its cost or step limit."""
 
 
+class ContextWindowExceeded(TerminatingException):
+    """Raised when the context window limit is exceeded."""
+
+
 class DefaultAgent:
     def __init__(self, model: Model, env: Environment, *, config_class: Callable = AgentConfig, **kwargs):
         self.config = config_class(**kwargs)

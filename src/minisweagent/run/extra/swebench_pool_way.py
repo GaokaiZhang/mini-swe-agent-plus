@@ -28,11 +28,14 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import subprocess
 import os
 
-from minisweagent.agents.default import DefaultAgent
+from minisweagent.agents.default import DefaultAgent, ContextWindowExceeded
 from minisweagent.config import builtin_config_dir, get_config_path
 from minisweagent.environments.docker import DockerEnvironment
 from minisweagent.environments.singularity import SingularityEnvironment
 from minisweagent.models import get_model
+
+# Maximum retry attempts for context window exceeded errors
+MAX_CONTEXT_RETRY_ATTEMPTS = 3
 
 from minisweagent.run.extra.utils.batch_progress import RunBatchProgressManager
 from minisweagent.run.utils.save import save_traj
@@ -205,15 +208,60 @@ def process_instance_proc(
             if docker_start_sem is not None:
                 docker_start_sem.release()
                 
-        # 真正跑 agent
-        agent = MPProgressAgent(
-            model,
-            env,
-            progress_queue=progress_queue,
-            instance_id=instance_id,
-            **config.get("agent", {}),
-        )
-        exit_status, result = agent.run(task)
+        # 真正跑 agent with retry logic for context window exceeded
+        exit_status = None
+        result = None
+
+        for attempt in range(1, MAX_CONTEXT_RETRY_ATTEMPTS + 1):
+            try:
+                # Create fresh model and agent for each attempt
+                model = get_model(model_name, config=config.get("model", {}))
+                agent = MPProgressAgent(
+                    model,
+                    env,
+                    progress_queue=progress_queue,
+                    instance_id=instance_id,
+                    **config.get("agent", {}),
+                )
+
+                if attempt > 1:
+                    try:
+                        progress_queue.put({
+                            "t": "status",
+                            "id": instance_id,
+                            "msg": f"Retry {attempt}/{MAX_CONTEXT_RETRY_ATTEMPTS} after context exceeded"
+                        })
+                    except Exception:
+                        pass
+
+                exit_status, result = agent.run(task)
+                # If we get here without exception, we succeeded
+                break
+
+            except ContextWindowExceeded as e:
+                if attempt < MAX_CONTEXT_RETRY_ATTEMPTS:
+                    try:
+                        progress_queue.put({
+                            "t": "status",
+                            "id": instance_id,
+                            "msg": f"Context exceeded (attempt {attempt}/{MAX_CONTEXT_RETRY_ATTEMPTS}), retrying..."
+                        })
+                    except Exception:
+                        pass
+                    continue
+                else:
+                    # All retries exhausted, discard this instance
+                    exit_status = "ContextWindowExceededDiscarded"
+                    result = f"Discarded after {MAX_CONTEXT_RETRY_ATTEMPTS} attempts: {e}"
+                    try:
+                        progress_queue.put({
+                            "t": "status",
+                            "id": instance_id,
+                            "msg": f"Discarded after {MAX_CONTEXT_RETRY_ATTEMPTS} context exceeded attempts"
+                        })
+                    except Exception:
+                        pass
+                    break
 
     except Exception as e:
         # 捕获所有异常，保证主进程能收到结果并收尾

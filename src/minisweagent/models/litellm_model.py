@@ -6,6 +6,21 @@ from pathlib import Path
 from typing import Any, Literal
 
 import litellm
+
+# Drop unsupported params (e.g., trust_remote_code) instead of raising errors
+# This fixes compatibility issues between LiteLLM and vLLM where LiteLLM passes
+# params that vLLM's SamplingParams doesn't accept
+litellm.drop_params = True
+
+# Handle version differences in litellm exceptions
+# UnsupportedParamsError was added in later versions
+try:
+    UnsupportedParamsError = litellm.exceptions.UnsupportedParamsError
+except AttributeError:
+    # Create a dummy exception that will never be raised for older litellm versions
+    class UnsupportedParamsError(Exception):
+        pass
+
 from tenacity import (
     before_sleep_log,
     retry,
@@ -16,6 +31,7 @@ from tenacity import (
 
 from minisweagent.models import GLOBAL_MODEL_STATS
 from minisweagent.models.utils.cache_control import set_cache_control
+from minisweagent.agents.default import ContextWindowExceeded
 
 logger = logging.getLogger("litellm_model")
 
@@ -52,13 +68,14 @@ class LitellmModel:
         before_sleep=before_sleep_log(logger, logging.WARNING),
         retry=retry_if_not_exception_type(
             (
-                litellm.exceptions.UnsupportedParamsError,
+                UnsupportedParamsError,
                 litellm.exceptions.NotFoundError,
                 litellm.exceptions.PermissionDeniedError,
                 litellm.exceptions.ContextWindowExceededError,
                 litellm.exceptions.APIError,
                 litellm.exceptions.AuthenticationError,
                 KeyboardInterrupt,
+                ContextWindowExceeded,  # Our custom exception for context exceeded
             )
         ),
     )
@@ -68,11 +85,11 @@ class LitellmModel:
             server_idx = str_hash_to_int(messages[1]['content']) % total_server
             api_base = self.vllm_urls[server_idx]
         else:
-            api_base = None 
+            api_base = None
         try:
             if api_base is not None:
                 return litellm.completion(
-                    api_base=api_base,    
+                    api_base=api_base,
                     model=self.config.model_name, messages=messages, **(self.config.model_kwargs | kwargs)
                 )
             else:
@@ -82,6 +99,16 @@ class LitellmModel:
         except litellm.exceptions.AuthenticationError as e:
             e.message += " You can permanently set your API key with `mini-extra config set KEY VALUE`."
             raise e
+        except litellm.exceptions.ContextWindowExceededError as e:
+            # Convert to our custom exception so it terminates the agent cleanly
+            raise ContextWindowExceeded(f"Context window exceeded: {e}") from e
+        except litellm.exceptions.InternalServerError as e:
+            # vLLM returns 500 errors for context window exceeded, check the message
+            error_msg = str(e).lower()
+            if "longer than the maximum model length" in error_msg or "context" in error_msg and "exceed" in error_msg:
+                raise ContextWindowExceeded(f"Context window exceeded (from 500 error): {e}") from e
+            # Re-raise other internal server errors
+            raise
 
     def query(self, messages: list[dict[str, str]], **kwargs) -> dict:
         if self.config.set_cache_control:
