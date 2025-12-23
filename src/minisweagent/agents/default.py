@@ -127,5 +127,8 @@ class DefaultAgent:
     def has_finished(self, output: dict[str, str]):
         """Raises Submitted exception with final output if the agent has finished its task."""
         lines = output.get("output", "").lstrip().splitlines(keepends=True)
+        # Skip WARNING lines from Apptainer/Singularity
+        while lines and lines[0].strip().startswith("WARNING:"):
+            lines = lines[1:]
         if lines and lines[0].strip() in ["MINI_SWE_AGENT_FINAL_OUTPUT", "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"]:
             raise Submitted("".join(lines[1:]))

@@ -78,13 +78,29 @@ def get_swebench_docker_image_name(instance: dict) -> str:
 
 
 def get_sb_environment(config: dict, instance: dict) -> Environment:
+    import os
     env_config = config.setdefault("environment", {})
     env_config["environment_class"] = env_config.get("environment_class", "docker")
     image_name = get_swebench_docker_image_name(instance)
     if env_config["environment_class"] == "docker":
         env_config["image"] = image_name
     elif env_config["environment_class"] == "singularity":
-        env_config["image"] = "docker://" + image_name
+        # Check if local SIF cache exists
+        sif_cache_dir = os.getenv("SWEBENCH_SIF_CACHE",
+                                   "/ocean/projects/cis250260p/gzhang15/cache/apptainer/swebench")
+        iid = instance["instance_id"]
+        id_safe = iid.replace("__", "_1776_").replace("/", "_")
+        sif_filename = f"sweb.eval.x86_64.{id_safe}.sif"
+        local_sif = Path(sif_cache_dir) / sif_filename
+
+        if local_sif.exists():
+            # Use local SIF file (no Docker Hub needed)
+            env_config["image"] = str(local_sif)
+            logger.info(f"Using cached SIF: {local_sif}")
+        else:
+            # Fall back to Docker Hub pull
+            env_config["image"] = "docker://" + image_name
+            logger.info(f"No cached SIF found, pulling from Docker Hub: {image_name}")
     env = get_environment(env_config)
     if startup_command := config.get("run", {}).get("env_startup_command"):
         startup_command = Template(startup_command, undefined=StrictUndefined).render(**instance)

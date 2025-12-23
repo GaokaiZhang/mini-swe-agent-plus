@@ -33,9 +33,13 @@ from minisweagent.config import builtin_config_dir, get_config_path
 from minisweagent.environments.docker import DockerEnvironment
 from minisweagent.environments.singularity import SingularityEnvironment
 from minisweagent.models import get_model
+from minisweagent.models.litellm_model import ContextLengthExceeded
 
 from minisweagent.run.extra.utils.batch_progress import RunBatchProgressManager
 from minisweagent.run.utils.save import save_traj
+
+# Maximum retry attempts for context length exceeded
+MAX_CONTEXT_RETRIES = 3
 
 _HELP_TEXT = """Run mini-SWE-agent on SWEBench instances.
 
@@ -194,8 +198,30 @@ def process_instance_proc(
             # Choose environment based on environment_class
             env_config = config.get("environment", {}).copy()
             if environment_class == "singularity":
-                # For Singularity/Apptainer, prepend docker:// to pull from Docker Hub
-                env_config["image"] = "docker://" + image_name
+                # Check if local SIF cache exists (avoids Docker Hub pulls)
+                sif_cache_dir = os.getenv("SWEBENCH_SIF_CACHE",
+                                         "/ocean/projects/cis250260p/gzhang15/cache/apptainer/swebench")
+                iid = instance["instance_id"]
+                id_safe = iid.replace("__", "_1776_").replace("/", "_")
+                sif_filename = f"sweb.eval.x86_64.{id_safe}.sif"
+                local_sif = Path(sif_cache_dir) / sif_filename
+
+                if local_sif.exists():
+                    # Use local SIF file (no Docker Hub needed)
+                    env_config["image"] = str(local_sif)
+                    try:
+                        progress_queue.put({"t": "status", "id": instance_id,
+                                           "msg": f"Using cached SIF: {sif_filename}"})
+                    except Exception:
+                        pass
+                else:
+                    # Fall back to Docker Hub pull
+                    env_config["image"] = "docker://" + image_name
+                    try:
+                        progress_queue.put({"t": "status", "id": instance_id,
+                                           "msg": f"No cached SIF, pulling: {image_name}"})
+                    except Exception:
+                        pass
                 env = SingularityEnvironment(**env_config)
             else:
                 # Docker environment
@@ -205,15 +231,48 @@ def process_instance_proc(
             if docker_start_sem is not None:
                 docker_start_sem.release()
                 
-        # 真正跑 agent
-        agent = MPProgressAgent(
-            model,
-            env,
-            progress_queue=progress_queue,
-            instance_id=instance_id,
-            **config.get("agent", {}),
-        )
-        exit_status, result = agent.run(task)
+        # 真正跑 agent with retry logic for context length exceeded
+        exit_status = None
+        result = None
+
+        for attempt in range(1, MAX_CONTEXT_RETRIES + 1):
+            try:
+                # Create fresh agent for each attempt
+                agent = MPProgressAgent(
+                    model,
+                    env,
+                    progress_queue=progress_queue,
+                    instance_id=instance_id,
+                    **config.get("agent", {}),
+                )
+
+                if attempt > 1:
+                    try:
+                        progress_queue.put({"t": "status", "id": instance_id,
+                                           "msg": f"Retry {attempt}/{MAX_CONTEXT_RETRIES} after context exceeded"})
+                    except Exception:
+                        pass
+
+                exit_status, result = agent.run(task)
+                # Success - break out of retry loop
+                break
+
+            except ContextLengthExceeded as e:
+                if attempt < MAX_CONTEXT_RETRIES:
+                    # Log and retry
+                    try:
+                        progress_queue.put({"t": "status", "id": instance_id,
+                                           "msg": f"Context exceeded ({e.current_tokens} tokens), retrying..."})
+                    except Exception:
+                        pass
+                    continue
+                else:
+                    # Max retries reached, give up
+                    raise ContextLengthExceeded(
+                        e.current_tokens, e.max_tokens,
+                        f"Context exceeded after {MAX_CONTEXT_RETRIES} attempts: "
+                        f"{e.current_tokens} tokens > {e.max_tokens} max"
+                    )
 
     except Exception as e:
         # 捕获所有异常，保证主进程能收到结果并收尾
@@ -434,6 +493,13 @@ def main(
                         )
                         # UI 收尾
                         progress_manager.on_instance_end(iid, payload["exit_status"])
+
+                        # Simple progress logging with timestamp
+                        from datetime import datetime
+                        has_patch = bool(payload.get("result", "").strip().startswith("diff "))
+                        completed = progress_manager._main_progress_bar.tasks[0].completed
+                        total = progress_manager._total_instances
+                        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {iid} | {payload['exit_status']} | patch={'yes' if has_patch else 'no'} | {completed}/{total}")
 
                         # ✅ 可见性提示：遇到 CalledProcessError 时，引导查看 error.log
                         if payload.get("exit_status") == "CalledProcessError":

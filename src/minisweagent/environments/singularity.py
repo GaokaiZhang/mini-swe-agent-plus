@@ -40,7 +40,10 @@ class SingularityEnvironment:
         # Building the sandbox can fail (very rarely), so we retry it
         max_retries = self.config.sandbox_build_retries
         for attempt in range(max_retries):
-            sandbox_dir = Path(tempfile.gettempdir()) / f"minisweagent-{uuid.uuid4().hex[:8]}"
+            # Use TMPDIR if set, otherwise fall back to system temp
+            # This is important for HPC clusters where /tmp may be small
+            tmp_base = os.environ.get("TMPDIR", tempfile.gettempdir())
+            sandbox_dir = Path(tmp_base) / f"minisweagent-{uuid.uuid4().hex[:8]}"
             try:
                 subprocess.run(
                     [self.config.executable, "build", "--sandbox", sandbox_dir, self.config.image],
@@ -65,7 +68,8 @@ class SingularityEnvironment:
         cmd = [self.config.executable, "exec"]
 
         # Do not inherit directories and env vars from host
-        cmd.extend(["--contain", "--cleanenv"])
+        # --no-home prevents binding $HOME which may not exist in container (e.g., /jet on Bridges-2)
+        cmd.extend(["--contain", "--cleanenv", "--no-home"])
 
         work_dir = cwd or self.config.cwd
         if work_dir and work_dir != "/":
