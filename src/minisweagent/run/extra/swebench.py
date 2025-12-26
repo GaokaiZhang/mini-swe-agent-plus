@@ -50,6 +50,13 @@ DATASET_MAPPING = {
 _OUTPUT_FILE_LOCK = threading.Lock()
 
 
+def _write_jsonl_from_dict(jsonl_path: Path, data: dict):
+    """Write predictions dict to JSONL format for SWE-bench evaluation."""
+    with open(jsonl_path, 'w') as f:
+        for instance_id, entry in data.items():
+            f.write(json.dumps(entry) + '\n')
+
+
 class ProgressTrackingAgent(DefaultAgent):
     """Simple wrapper around DefaultAgent that provides progress updates."""
 
@@ -106,6 +113,8 @@ def update_preds_file(output_path: Path, instance_id: str, model_name: str, resu
             "model_patch": result,
         }
         output_path.write_text(json.dumps(output_data, indent=2))
+        # Also write JSONL file for direct evaluation use
+        _write_jsonl_from_dict(output_path.parent / "predictions.jsonl", output_data)
 
 
 def remove_from_preds_file(output_path: Path, instance_id: str):
@@ -117,6 +126,8 @@ def remove_from_preds_file(output_path: Path, instance_id: str):
         if instance_id in output_data:
             del output_data[instance_id]
             output_path.write_text(json.dumps(output_data, indent=2))
+            # Also update JSONL file
+            _write_jsonl_from_dict(output_path.parent / "predictions.jsonl", output_data)
 
 
 def process_instance(
