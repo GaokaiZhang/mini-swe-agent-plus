@@ -182,7 +182,18 @@ def process_instance_proc(
     image_name = get_swebench_docker_image_name(instance)
     config = yaml.safe_load(get_config_path(config_path).read_text())
     model = get_model(model_name, config=config.get("model", {}))
-    task = instance["problem_statement"]
+
+    # Check for custom problem statements (e.g., with hints injected)
+    custom_problems_file = os.getenv("CUSTOM_PROBLEMS_FILE")
+    if custom_problems_file and Path(custom_problems_file).exists():
+        with open(custom_problems_file) as f:
+            custom_problems = {json.loads(line)["instance_id"]: json.loads(line) for line in f if line.strip()}
+        if instance_id in custom_problems:
+            task = custom_problems[instance_id]["problem_statement"]
+        else:
+            task = instance["problem_statement"]
+    else:
+        task = instance["problem_statement"]
 
     agent = None
     extra_info = None
