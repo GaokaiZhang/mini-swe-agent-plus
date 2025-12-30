@@ -414,8 +414,12 @@ def main(
     # 加载数据集
     dataset_path = DATASET_MAPPING.get(subset, subset)
     print(f"Loading dataset {dataset_path}, split {split}...")
-    if subset in ('verified100', 'verified236', 'mysmith'):
-        instances = list(load_dataset("json", data_files=dataset_path, split="train"))
+    if subset in ('verified100', 'verified236', 'mysmith') or dataset_path.endswith('.json'):
+        # Load from local JSON file
+        if dataset_path.endswith('.json'):
+            instances = json.loads(Path(dataset_path).read_text())
+        else:
+            instances = list(load_dataset("json", data_files=dataset_path, split="train"))
     else:
         instances = list(load_dataset(dataset_path, split=split))
 
